@@ -309,35 +309,35 @@ def train(data_dict, args):
                     precisions.append(precision)
                     hitrates.append(hitrate)
                 
-                    # # method 2: cosine distance
-                    # cos_dist = cosine_distances(h_nodes, h_item)
-                    # top_distk = np.argsort(cos_dist)[:, :args.k].flatten()
-                    # top_distk = evaluation.node_to_item(top_distk, nid_wid_dict, data_dict['item_category'])
-                    # tp1 = [x for x in label if x in top_distk]
-                    # if not tp1:
-                    #     # if none of the recommendations were in testset
-                    #     recall1, precision1, hitrate1 = 0, 0, 0
-                    # else:
-                    #     # if recommendations were available in testset
-                    #     # out of total items in testset we recommended
-                    #     recall1 = len(set(tp1)) / len(label) 
-                    #     # out of total recommendations how many were in testset
-                    #     precision1 = len(set(tp1)) / len(set(top_distk))
-                    #     hitrate1 = 1  # There is at least one
+                    # method 2: cosine distance
+                    cos_dist = cosine_distances(h_nodes, h_item)
+                    top_distk = np.argsort(cos_dist)[:, :args.k].flatten()
+                    top_distk = evaluation.node_to_item(top_distk, nid_wid_dict, data_dict['item_category'])
+                    tp1 = [x for x in label if x in top_distk]
+                    if not tp1:
+                        # if none of the recommendations were in testset
+                        recall1, precision1, hitrate1 = 0, 0, 0
+                    else:
+                        # if recommendations were available in testset
+                        # out of total items in testset we recommended
+                        recall1 = len(set(tp1)) / len(label) 
+                        # out of total recommendations how many were in testset
+                        precision1 = len(set(tp1)) / len(set(top_distk))
+                        hitrate1 = 1  # There is at least one
 
-                    # recalls1.append(recall1)
-                    # precisions1.append(precision1)
-                    # hitrates1.append(hitrate1)
+                    recalls1.append(recall1)
+                    precisions1.append(precision1)
+                    hitrates1.append(hitrate1)
             
             result_df = pd.DataFrame({'recall': recalls, 'precision': precisions, 'hitrate': hitrates})
             result_df = result_df.mean().apply(lambda x: round(x, 3))
             recall, precision, hitrate = result_df['recall'], result_df['precision'], result_df['hitrate']
             print(f'\tEpoch:{epoch}\tRecall:{recall}\tHitrate:{hitrate}\tPrecision:{precision}')
 
-            # result_df1 = pd.DataFrame({'recall1': recalls1, 'precision1': precisions1, 'hitrate1': hitrates1})
-            # result_df1 = result_df1.mean().apply(lambda x: round(x, 3))
-            # recall1, precision1, hitrate1 = result_df1['recall1'], result_df1['precision1'], result_df1['hitrate1']
-            # print(f'\tEpoch:{epoch}\tRecall1:{recall1}\tHitrate1:{hitrate1}\tPrecision1:{precision1}')
+            result_df1 = pd.DataFrame({'recall1': recalls1, 'precision1': precisions1, 'hitrate1': hitrates1})
+            result_df1 = result_df1.mean().apply(lambda x: round(x, 3))
+            recall1, precision1, hitrate1 = result_df1['recall1'], result_df1['precision1'], result_df1['hitrate1']
+            print(f'\tEpoch:{epoch}\tRecall1:{recall1}\tHitrate1:{hitrate1}\tPrecision1:{precision1}')
 
         if args.save_epochs:
             if not epoch % args.save_epochs:
