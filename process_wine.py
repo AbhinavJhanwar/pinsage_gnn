@@ -1,8 +1,9 @@
+# %%
 import os
 import re
 import json
 import pickle
-import argparse
+from argparse import Namespace
 import scipy.sparse as ssp
 from collections import defaultdict
 
@@ -15,12 +16,10 @@ import torchtext
 from builder import PandasGraphBuilder
 from data_utils import *
 
+# %%
 print('Processing Started!')
 
-parser = argparse.ArgumentParser()
-parser.add_argument('--directory', type=str)
-parser.add_argument('--output_path', type=str)
-args = parser.parse_args()
+args = Namespace(directory='data', output_path='data.pkl')
 directory = args.directory
 output_path = args.output_path
 
@@ -49,48 +48,34 @@ items['wine_feats'] = list(items[['rating_average', 'body', 'acidity_x' ,'alcoho
 
 
 # Rating Data
-# 8:2
 columns = ['userID', 'wine_id', 'rating_per_user']
 
 with open(os.path.join(directory, 'train.json')) as f:
     train = json.load(f)
 train = pd.DataFrame(train['data'])
 
-'''
-* Like
-I thought about whether it would be a good choice to recommend an item that the user did not evaluate well.
-If you want to learn regardless of the rating, you can remove the code related to like.
-
-We set the standard for like as a rating of 3.
-I think it would be good to set this part according to your own thoughts.
-'''
-train['like'] = [1 if x >= 3 else 0 for x in train['rating_per_user']]
-train = train[train['like'] == 1]
-train = train[columns]
-
 with open(os.path.join(directory, 'test.json')) as f:
     test = json.load(f)
 test = pd.DataFrame(test['data'])
 
-test['like'] = [1 if x >= 3 else 0 for x in test['rating_per_user']]
-test = test[test['like'] == 1]
-test = test[columns]
-
 ratings = pd.concat([train, test], axis=0, ignore_index=True)
+# keep only the users that have count > 1
 user_filter = [k for k, v in ratings['userID'].value_counts().items() if v > 1]
+# filter test/train >> ratings data as per above users
 ratings = ratings[ratings['userID'].isin(user_filter)]
 
-# Build Graph
-# 아이템, 유저 DB에 존재하는 rating만 사용
+# take out only users that are available in user data and ratings data
 user_intersect = set(ratings['userID'].values) & set(users['userID'].values)
+# take out only wines that are available in wine data and ratings data
 item_intersect = set(ratings['wine_id'].values) & set(items['wine_id'].values)
 
+# update ratings, users and items dataframe based on above users and items
 new_users = users[users['userID'].isin(user_intersect)]
 new_items = items[items['wine_id'].isin(item_intersect)]
 new_ratings = ratings[ratings['userID'].isin(user_intersect) & ratings['wine_id'].isin(item_intersect)]
 new_ratings = new_ratings.sort_values('userID')
 
-
+# create labels to divide data into train and test set (8:2 per user), for train label is 0 and for test it is 1
 label = []
 for userID, df in new_ratings.groupby('userID'):
     idx = int(df.shape[0] * 0.8)
@@ -101,27 +86,29 @@ new_ratings['timestamp'] = label
 
 # Build graph
 graph_builder = PandasGraphBuilder()
-graph_builder.add_entities(new_users, 'userID', 'user')
-graph_builder.add_entities(new_items, 'wine_id', 'wine')
-graph_builder.add_binary_relations(new_ratings, 'userID', 'wine_id', 'rated')
-graph_builder.add_binary_relations(new_ratings, 'wine_id', 'userID', 'rated-by')
+graph_builder.add_entities(new_users, 'userID', 'user') # df name, column, node
+graph_builder.add_entities(new_items, 'wine_id', 'wine') # df name, column, node
+graph_builder.add_binary_relations(new_ratings, 'userID', 'wine_id', 'rated') # df name, node1, node2, relation_name
+graph_builder.add_binary_relations(new_ratings, 'wine_id', 'userID', 'rated-by')# df name, node1, node2, relation_name
 g = graph_builder.build()
 
 
-# Assign features.
+# Assign features to nodes.
 node_dict = { 
-    'user': [new_users, ['userID', 'user_feats'], ['cat', 'int']],
+    'user': [new_users, ['userID', 'user_feats'], ['cat', 'int']], # [df, [column names], [column types]]
     'wine': [new_items, ['wine_id', 'grapes_id', 'wine_feats'], ['cat', 'cat', 'int']]
 }
+
+# Assign weights/features to edges
 edge_dict = { 
     'rated': [new_ratings, ['rating_per_user', 'timestamp']],
     'rated-by': [new_ratings, ['rating_per_user', 'timestamp']]
 }
 
-for key, (df, features ,dtypes) in node_dict.items():
+for key, (df, features, dtypes) in node_dict.items():
     for value, dtype in zip(features, dtypes):
         # key = 'user' or 'wine'
-        # value = 'user_follower_count' 등등
+        # value = ['user_follower_count', 'user_rating_count'] or [rating_average, body, acidity_x, alcohol]
         if dtype == 'int':
             array = np.array([i for i in df[value].values])
             g.nodes[key].data[value] = torch.FloatTensor(array)
@@ -132,14 +119,14 @@ for key, (df, features) in edge_dict.items():
     for value in features:
         g.edges[key].data[value] = torch.LongTensor(df[value].values.astype(np.float32))
 
-# 실제 ID와 카테고리 ID 딕셔너리
+# real id, category id dictionary
 user_cat = new_users['userID'].astype('category').cat.codes.values
 item_cat = new_items['wine_id'].astype('category').cat.codes.values
 
 user_cat_dict = {k: v for k, v in zip(user_cat, new_users['userID'].values)}
 item_cat_dict = {k: v for k, v in zip(item_cat, new_items['wine_id'].values)}
 
-# Label
+# validation dictionary
 val_dict = defaultdict(set)
 for userID, df in new_ratings.groupby('userID'):
     val_dict[userID] = set(df[df['timestamp'] == 1]['wine_id'].values)

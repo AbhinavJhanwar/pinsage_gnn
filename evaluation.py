@@ -1,22 +1,11 @@
+# %%
 import numpy as np
 import pandas as pd
 import torch
 import pickle
 import dgl
-import argparse
+from argparse import Namespace
 from sklearn.neighbors import NearestNeighbors
-
-def check_param_num(model):
-    '''
-    check num of model parameters
-
-    :model: pytorch model object
-    :return: int
-    '''
-    param_num = 0 
-    for parameter in model.parameters():
-        param_num += parameter.shape[0]
-    return param
 
 def node_to_item(nodes, id_dict, cateogry_dict):
     '''
@@ -61,7 +50,7 @@ def item_by_user_batch(graph, user_ntype, item_ntype, user_to_item_etype, weight
         user_ntype, item_ntype, user_to_item_etype, weight, args.batch_size)
 
     graph_slice = graph.edge_type_subgraph([rec_engine.user_to_item_etype])
-    n_users = graph.number_of_nodes(rec_engine.user_ntype)  # 유저개수
+    n_users = graph.number_of_nodes(rec_engine.user_ntype)  # number of users
     latest_interactions = dgl.sampling.select_topk(graph_slice, args.k, rec_engine.timestamp, edge_dir='out')
     user, latest_items = latest_interactions.all_edges(form='uv', order='srcdst')
     # user, latest_items = (k * n_users)
@@ -131,16 +120,15 @@ def evaluate_nn(dataset, h_item, k, batch_size):
     recommendations = rec_engine.recommend(g, k, None, h_item).cpu().numpy()
     return prec(recommendations, val_matrix)
 
+# %%
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('dataset_path', type=str)
-    parser.add_argument('item_embedding_path', type=str)
-    parser.add_argument('-k', type=int, default=10)
-    parser.add_argument('--batch-size', type=int, default=32)
-    args = parser.parse_args()
-
+    args = Namespace(dataset_path='data.pkl', item_embedding_path='_1epoch.pt',
+                     batch_size=32, k=10)
+    
     with open(args.dataset_path, 'rb') as f:
         dataset = pickle.load(f)
+        
     with open(args.item_embedding_path, 'rb') as f:
         emb = torch.FloatTensor(pickle.load(f))
     print(evaluate_nn(dataset, emb, args.k, args.batch_size))
+

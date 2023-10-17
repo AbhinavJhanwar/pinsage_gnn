@@ -1,5 +1,5 @@
+# %%
 import pickle
-import argparse
 
 import torch
 import torch.nn as nn
@@ -7,11 +7,93 @@ import pandas as pd
 import numpy as np
 import torchtext
 from torch.utils.data import DataLoader
-from tqdm.auto import tqdm
+from tqdm import tqdm
+from tqdm.auto import tqdm as tq_
 
 import layers
 import sampler as sampler_module
 import evaluation
+from argparse import Namespace
+from sklearn.metrics.pairwise  import cosine_distances
+
+
+def get_recommendations(data_dict, args, model_path='epoch.pt'):
+
+    data_dict = prepare_dataset(data_dict, args)
+    device = torch.device(f'cuda:{args.device}' if torch.cuda.is_available() else 'cpu')
+    if device.type == 'cpu':
+        print('Current using CPUs')
+    else:
+        print ('Current cuda device ', torch.cuda.current_device()) # check
+
+    gnn = PinSAGEModel(data_dict['graph'], data_dict['item_ntype'], data_dict['textset'], args.hidden_dims, args.num_layers).to(device)
+    opt = torch.optim.Adam(gnn.parameters(), lr=args.lr)
+    checkpoint = torch.load(model_path, map_location=device)
+    gnn.load_state_dict(checkpoint['model_state_dict'])
+    opt.load_state_dict(checkpoint['optimizer_state_dict'])
+
+    g = data_dict['graph']
+    item_ntype = data_dict['item_ntype']
+    user_ntype = data_dict['user_ntype']
+    user_to_item_etype = data_dict['user_to_item_etype']
+    timestamp = data_dict['timestamp']
+    nid_uid_dict = {v: k for v, k in enumerate(list(g.ndata['userID'].values())[0].numpy())}
+    nid_wid_dict = {nid.item(): wid.item() for wid, nid in  zip(g.ndata['wine_id']['wine'], g.ndata['id']['wine'])}
+
+
+    gnn = gnn.to(device)
+
+    neighbor_sampler = sampler_module.NeighborSampler(
+        g, user_ntype, item_ntype, args.random_walk_length,
+        args.random_walk_restart_prob, args.num_random_walks, args.num_neighbors,
+        args.num_layers)
+    
+    # get embedding of all items (wine)
+    h_item = evaluation.get_all_emb(gnn, g.ndata['id'][item_ntype], data_dict['textset'], item_ntype, neighbor_sampler, args.batch_size, device)
+    # get interacted node ids for all users
+    item_batch = evaluation.item_by_user_batch(g, user_ntype, item_ntype, user_to_item_etype, timestamp, args)
+    users = []
+
+    for i, nodes in tq_(enumerate(item_batch)):
+        '''
+        nodes : Actual interaction nodes per user [train node, test node (8: 2 ratio)]
+        '''
+        # get Real user ID from given ID
+        category = nid_uid_dict[i]
+        user_id = data_dict['user_category'][category]  # real user id
+        label = data_dict['testset'][user_id]  # test label
+        users.append(user_id)
+
+        # Explore Real Wine IDs
+        item = evaluation.node_to_item(nodes, nid_wid_dict, data_dict['item_category'])  # wine ID
+
+        # get interacted wine IDs that are available in testset
+        label_idx = [i for i, x in enumerate(item) if x in label]  # label index
+
+        # Item Recommendation
+        # get nodes that are not in test set i.e. they are in training set
+        test_nodes = [x for i, x in enumerate(nodes) if i in label_idx]  # label index Nodes for training without input
+        train_nodes = [x for i, x in enumerate(nodes) if i not in label_idx]  # label index Nodes for training without input
+        if len(train_nodes)>0 and len(test_nodes)>0:
+            # get embedding of above nodes i.e. embedding of training data
+            h_nodes_train = h_item[train_nodes]
+            # get center embedding of training data
+            h_center = torch.mean(h_nodes_train, axis=0) 
+
+            # method 1: distance between above embedding with rest of the embeddings 
+            dist = h_center @ h_item.t()  # matrix multiplication
+            # dist Extract k items in order of size
+            topk = dist.topk(300)[1].cpu().numpy()  
+            topk = evaluation.node_to_item(topk, nid_wid_dict, data_dict['item_category'])  # ID conversion
+            tp = [x for x in label if x in topk]
+            print('method 1', tp)
+
+            # method 2: cosine distance
+            cos_dist = cosine_distances(h_nodes_train, h_item)
+            top_distk = np.argsort(cos_dist)[:, :300].flatten()#[:args.k]
+            top_distk = evaluation.node_to_item(top_distk, nid_wid_dict, data_dict['item_category'])
+            tp = [x for x in label if x in top_distk]
+            print('method 2', tp)
 
 class PinSAGEModel(nn.Module):
     def __init__(self, full_graph, ntype, textsets, hidden_dims, n_layers):
@@ -51,8 +133,8 @@ def prepare_dataset(data_dict, args):
     user_ntype = data_dict['user_ntype']
     item_ntype = data_dict['item_ntype']
 
-    # Assign user and movie IDs and use them as features (to learn an individual trainable
-    # embedding for each entity)
+    # Assign IDs to user & wine under 'id' feature
+    # (to learn an individual trainable embedding for each entity)
     g.nodes[user_ntype].data['id'] = torch.arange(g.number_of_nodes(user_ntype))
     g.nodes[item_ntype].data['id'] = torch.arange(g.number_of_nodes(item_ntype))
     data_dict['graph'] = g
@@ -61,8 +143,8 @@ def prepare_dataset(data_dict, args):
     if not len(item_texts):
         data_dict['textset'] = None
     else:
-        fields = {}
-        examples = []
+        fields = {} # {'name': <torchtext.data.field.Field at 0x7ffaf4fb45b0>}
+        examples = [] # [[wine_name, [('name', fields['name'])]]]
         for key, texts in item_texts.items():
             fields[key] = torchtext.data.Field(include_lengths=True, lower=True, batch_first=True)
         for i in range(g.number_of_nodes(item_ntype)):
@@ -84,13 +166,18 @@ def prepare_dataloader(data_dict, args):
     user_ntype = data_dict['user_ntype']
     item_ntype = data_dict['item_ntype']
     textset = data_dict['textset']
-    # Sampler
+    # batch_sampler >> this will act as ground truth value
+    # Sampler returns [[starting item nodes (heads)], [related item nodes (pos tails)], [not related item nodes (neg tails)]] >> size is per given batch
     batch_sampler = sampler_module.ItemToItemBatchSampler(
         g, user_ntype, item_ntype, args.batch_size)
+    
+    # get input >> provides n number of neighbors for the given node as per random walks
     neighbor_sampler = sampler_module.NeighborSampler(
         g, user_ntype, item_ntype, args.random_walk_length,
         args.random_walk_restart_prob, args.num_random_walks, args.num_neighbors,
         args.num_layers)
+    
+    # this will call batch_sampler and then provide neighbors on heads
     collator = sampler_module.PinSAGECollator(neighbor_sampler, g, item_ntype, textset)
     dataloader = DataLoader(
         batch_sampler,
@@ -112,7 +199,8 @@ def train(data_dict, args):
         print('Current using CPUs')
     else:
         print ('Current cuda device ', torch.cuda.current_device()) # check
-    # Dataset
+
+    # Dataset (adds another key with text encoded data)
     data_dict = prepare_dataset(data_dict, args)
     dataloader_it, dataloader_test, neighbor_sampler = prepare_dataloader(data_dict, args)
     
@@ -156,51 +244,100 @@ def train(data_dict, args):
             continue
         
         if args.eval_epochs and not epoch % args.eval_epochs:
+            print('\nEvaluating...')
+            # get embedding of all items (wine)
             h_item = evaluation.get_all_emb(gnn, g.ndata['id'][item_ntype], data_dict['textset'], item_ntype, neighbor_sampler, args.batch_size, device)
+            # get interacted node ids for all users
             item_batch = evaluation.item_by_user_batch(g, user_ntype, item_ntype, user_to_item_etype, timestamp, args)
             recalls = []
             precisions = [] 
             hitrates = []
+
+            recalls1 = []
+            precisions1 = [] 
+            hitrates1 = []
+
             users = []
 
-            for i, nodes in enumerate(item_batch):
+            for i, nodes in tq_(enumerate(item_batch)):
                 '''
-                nodes : 유저당 실제 인터랙션 노드들 [train 노드, test 노드 (8: 2비율)]
+                nodes : Actual interaction nodes per user [train node, test node (8: 2 ratio)]
                 '''
-                # 실제 유저 ID 탐색
+                # get Real user ID from given ID
                 category = nid_uid_dict[i]
-                user_id = data_dict['user_category'][category]  # 실제 유저 id
-                label = data_dict['testset'][user_id]  # 테스트 라벨
+                user_id = data_dict['user_category'][category]  # real user id
+                label = data_dict['testset'][user_id]  # test label
                 users.append(user_id)
 
-                # 실제 와인 ID 탐색
-                item = evaluation.node_to_item(nodes, nid_wid_dict, data_dict['item_category'])  # 와인 ID
-                label_idx = [i for i, x in enumerate(item) if x in label]  # 라벨 인덱스
+                # Explore Real Wine IDs
+                item = evaluation.node_to_item(nodes, nid_wid_dict, data_dict['item_category'])  # wine ID
+                # get interacted wine IDs index that are available in testset
+                label_idx = [i for i, x in enumerate(item) if x in label]  # label index
 
-                # 아이템 추천
-                nodes = [x for i, x in enumerate(nodes) if i not in label_idx]  # 라벨 인덱스 미포함 입력 학습용 노드
-                h_nodes = h_item[nodes]
-                h_center = torch.mean(h_nodes, axis=0)  # 중앙 임베딩  
-                dist = h_center @ h_item.t()  # 행렬곱
-                topk = dist.topk(args.k)[1].cpu().numpy()  # dist 크기 순서로 k개 추출
-                topk = evaluation.node_to_item(topk, nid_wid_dict, data_dict['item_category'])  # ID 변환
+                # Item Recommendation
+                test_nodes = [x for i, x in enumerate(nodes) if i in label_idx]  # label index Nodes for testing without input
+                # get nodes that are not in test set i.e. they are in training set
+                train_nodes = [x for i, x in enumerate(nodes) if i not in label_idx]  # label index Nodes for training without input
+                if len(train_nodes)>0 and len(test_nodes)>0:
+                        
+                    # get embedding of above nodes i.e. embedding of training data
+                    h_nodes = h_item[train_nodes]
 
-                tp = [x for x in label if x in topk]
-                if not tp:
-                    recall, precision, hitrate = 0, 0, 0
-                else:
-                    recall = len(tp) / len(label) 
-                    precision = len(tp) / len(topk)
-                    hitrate = 1  # 하나라도 있음
+                    # method 1
+                    # get center embedding of training data
+                    h_center = torch.mean(h_nodes, axis=0) 
+                    # get distance between above embedding with rest of the embeddings 
+                    dist = h_center @ h_item.t()  # matrix multiplication
+                    # dist Extract k items in order of size
+                    topk = dist.topk(args.k)[1].cpu().numpy()  
+                    topk = evaluation.node_to_item(topk, nid_wid_dict, data_dict['item_category'])  # ID conversion
 
-                recalls.append(recall)
-                precisions.append(precision)
-                hitrates.append(hitrate)
+                    # now check if any recommendations were from wine IDs that are in test set
+                    tp = [x for x in label if x in topk]
+                    if not tp:
+                        # if none of the recommendations were in testset
+                        recall, precision, hitrate = 0, 0, 0
+                    else:
+                        # if recommendations were available in testset
+                        # out of total items in testset we recommended
+                        recall = len(tp) / len(label) 
+                        # out of total recommendations how many were in testset
+                        precision = len(tp) / len(topk)
+                        hitrate = 1  # There is at least one
 
+                    recalls.append(recall)
+                    precisions.append(precision)
+                    hitrates.append(hitrate)
+                
+                    # # method 2: cosine distance
+                    # cos_dist = cosine_distances(h_nodes, h_item)
+                    # top_distk = np.argsort(cos_dist)[:, :args.k].flatten()
+                    # top_distk = evaluation.node_to_item(top_distk, nid_wid_dict, data_dict['item_category'])
+                    # tp1 = [x for x in label if x in top_distk]
+                    # if not tp1:
+                    #     # if none of the recommendations were in testset
+                    #     recall1, precision1, hitrate1 = 0, 0, 0
+                    # else:
+                    #     # if recommendations were available in testset
+                    #     # out of total items in testset we recommended
+                    #     recall1 = len(set(tp1)) / len(label) 
+                    #     # out of total recommendations how many were in testset
+                    #     precision1 = len(set(tp1)) / len(set(top_distk))
+                    #     hitrate1 = 1  # There is at least one
+
+                    # recalls1.append(recall1)
+                    # precisions1.append(precision1)
+                    # hitrates1.append(hitrate1)
+            
             result_df = pd.DataFrame({'recall': recalls, 'precision': precisions, 'hitrate': hitrates})
             result_df = result_df.mean().apply(lambda x: round(x, 3))
             recall, precision, hitrate = result_df['recall'], result_df['precision'], result_df['hitrate']
             print(f'\tEpoch:{epoch}\tRecall:{recall}\tHitrate:{hitrate}\tPrecision:{precision}')
+
+            # result_df1 = pd.DataFrame({'recall1': recalls1, 'precision1': precisions1, 'hitrate1': hitrates1})
+            # result_df1 = result_df1.mean().apply(lambda x: round(x, 3))
+            # recall1, precision1, hitrate1 = result_df1['recall1'], result_df1['precision1'], result_df1['hitrate1']
+            # print(f'\tEpoch:{epoch}\tRecall1:{recall1}\tHitrate1:{hitrate1}\tPrecision1:{precision1}')
 
         if args.save_epochs:
             if not epoch % args.save_epochs:
@@ -213,39 +350,31 @@ def train(data_dict, args):
 
     return gnn, epoch+1, opt, loss
 
+# %%
 if __name__ == '__main__':
-    # Arguments
-    parser = argparse.ArgumentParser()
-    parser.add_argument('-d', '--dataset-path', type=str)
-    parser.add_argument('-s', '--save-path', type=str, default='model')
-    parser.add_argument('--random-walk-length', type=int, default=2)
-    parser.add_argument('--random-walk-restart-prob', type=float, default=0.5)
-    parser.add_argument('--num-random-walks', type=int, default=10)
-    parser.add_argument('--num-neighbors', type=int, default=3)
-    parser.add_argument('--num-layers', type=int, default=2)
-    parser.add_argument('--hidden-dims', type=int, default=16)
-    parser.add_argument('--batch-size', type=int, default=32)
-    parser.add_argument('--device', type=str, default='cpu')  # 'cpu' or 'cuda:N'
-    parser.add_argument('--num-epochs', type=int, default=1)
-    parser.add_argument('--batches-per-epoch', type=int, default=10000)
-    parser.add_argument('--num-workers', type=int, default=0)
-    parser.add_argument('--lr', type=float, default=3e-5)
-    parser.add_argument('--eval-epochs', type=int, default=0)
-    parser.add_argument('--save-epochs', type=int, default=0)
-    parser.add_argument('--retrain', type=int, default=0)
-    parser.add_argument('-k', type=int, default=10)
-    args = parser.parse_args()
-
-    # Load dataset
+    
+    # Namespace(dataset_path='data.pkl', save_path='', random_walk_length=2, 
+    #                  random_walk_restart_prob=0.5, num_random_walks=10,
+    #                  num_neighbors=3, num_layers=2, hidden_dims=16, batch_size=64,
+    #                  device='cpu', num_epochs=25, batches_per_epoch=5000, num_workers=0, 
+    #                  lr=3e-4, eval_epochs=1, save_epochs=0, retrain=0, k=10)
+    
+    args = Namespace(dataset_path='data.pkl', save_path='', random_walk_length=2, 
+                     random_walk_restart_prob=0.5, num_random_walks=10,
+                     num_neighbors=3, num_layers=2, hidden_dims=128, batch_size=128,
+                     device='cpu', num_epochs=499, batches_per_epoch=256, num_workers=4, 
+                     lr=3e-5, eval_epochs=5, save_epochs=10, retrain=0, k=500)
+    
     with open(args.dataset_path, 'rb') as f:
         dataset = pickle.load(f)
-        
+
     data_dict = {
         'graph': dataset['train-graph'],
         'val_matrix': None,
         'test_matrix': None,
         'item_texts': dataset['item-texts'],
         'testset': dataset['testset'], 
+        'new_ratings': dataset['rating-data'],
         'user_ntype': dataset['user-type'],
         'item_ntype': dataset['item-type'],
         'user_to_item_etype': dataset['user-to-item-type'],
@@ -254,6 +383,7 @@ if __name__ == '__main__':
         'item_category': dataset['item-category']
     }
     
+   
     # Training
     gnn, epoch, opt, loss = train(data_dict, args)
 
@@ -264,3 +394,5 @@ if __name__ == '__main__':
                 'optimizer_state_dict': opt.state_dict(),
                 'loss': loss
             }, args.save_path + '_' + str(epoch) + 'epoch.pt')
+
+    #get_recommendations(data_dict, args, '_500epoch.pt')

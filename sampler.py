@@ -16,19 +16,25 @@ class ItemToItemBatchSampler(IterableDataset):
         self.g = g
         self.user_type = user_type
         self.item_type = item_type
-        self.user_to_item_etype = list(g.metagraph()[user_type][item_type])[0]
+        # user to item relation- rated
+        self.user_to_item_etype = list(g.metagraph()[user_type][item_type])[0] 
+        # item to user relation- rated-by
         self.item_to_user_etype = list(g.metagraph()[item_type][user_type])[0]
         self.batch_size = batch_size
 
     def __iter__(self):
         while True:
+            # generate tensor of random items of give batch size which will act as starting nodes
             heads = torch.randint(0, self.g.number_of_nodes(self.item_type), (self.batch_size,))
+            # extracts positive samples related to above head nodes and if a related node is not found then returns -1
             tails = dgl.sampling.random_walk(
                 self.g,
                 heads,
                 metapath=[self.item_to_user_etype, self.user_to_item_etype])[0][:, 2]
+            # for negative samples take random item nodes
             neg_tails = torch.randint(0, self.g.number_of_nodes(self.item_type), (self.batch_size,))
 
+            # keep only nodes for which neighbors were found
             mask = (tails != -1)
             yield heads[mask], tails[mask], neg_tails[mask]
 
@@ -40,6 +46,9 @@ class NeighborSampler(object):
         self.item_type = item_type
         self.user_to_item_etype = list(g.metagraph()[user_type][item_type])[0]
         self.item_to_user_etype = list(g.metagraph()[item_type][user_type])[0]
+        # if you want then you can provide edge weight here
+        # this will create pinsage sampler and in the end returns the given number of neighbors as per given number of random walks (most visited neighbors)
+        # example >> for sample nodes 1, 2 (we will see below) >> (g, 'wine', 'user', 2, 0.5, 10, 3) >> ([45, 32, 65, 76, 84, 57], [1, 1, 1, 2, 2, 2]) >> ([neighbors], [given_node])
         self.samplers = [
             dgl.sampling.PinSAGESampler(g, item_type, user_type, random_walk_length,
                 random_walk_restart_prob, num_random_walks, num_neighbors)
@@ -73,6 +82,7 @@ class NeighborSampler(object):
             (heads, neg_tails),
             num_nodes=self.g.number_of_nodes(self.item_type))
         pos_graph, neg_graph = dgl.compact_graphs([pos_graph, neg_graph])
+        # this will return a single tensor with combined unique heads, tails and neg_tails nodes
         seeds = pos_graph.ndata[dgl.NID]
 
         blocks = self.sample_blocks(seeds, heads, tails, neg_tails)
