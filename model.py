@@ -172,6 +172,7 @@ def prepare_dataloader(data_dict, args):
         g, user_ntype, item_ntype, args.batch_size)
     
     # get input >> provides n number of neighbors for the given node as per random walks
+    # last argument is optional which is not available here but is the weight for edges or connections
     neighbor_sampler = sampler_module.NeighborSampler(
         g, user_ntype, item_ntype, args.random_walk_length,
         args.random_walk_restart_prob, args.num_random_walks, args.num_neighbors,
@@ -363,7 +364,7 @@ if __name__ == '__main__':
                      random_walk_restart_prob=0.5, num_random_walks=10,
                      num_neighbors=3, num_layers=2, hidden_dims=128, batch_size=128,
                      device='cpu', num_epochs=499, batches_per_epoch=256, num_workers=4, 
-                     lr=3e-5, eval_epochs=5, save_epochs=10, retrain=0, k=500)
+                     lr=3e-5, eval_epochs=10, save_epochs=10, retrain=0, k=500)
     
     with open(args.dataset_path, 'rb') as f:
         dataset = pickle.load(f)

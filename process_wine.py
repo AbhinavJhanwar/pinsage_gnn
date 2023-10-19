@@ -119,6 +119,11 @@ for key, (df, features) in edge_dict.items():
     for value in features:
         g.edges[key].data[value] = torch.LongTensor(df[value].values.astype(np.float32))
 
+# save graph
+dgl.data.utils.save_graphs('graph.bin', g)
+# load graph
+g = dgl.data.utils.load_graphs('graph.bin', g)[0][0]
+
 # real id, category id dictionary
 user_cat = new_users['userID'].astype('category').cat.codes.values
 item_cat = new_items['wine_id'].astype('category').cat.codes.values
